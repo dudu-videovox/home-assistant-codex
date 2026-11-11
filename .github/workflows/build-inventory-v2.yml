@@ -1,0 +1,245 @@
+name: Build Codex Worker inventory-v2 image
+
+on:
+  workflow_dispatch:
+
+# Checkout and artifact upload do not require actions: write.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout workflow and patch
+        uses: actions/checkout@v4
+        with:
+          path: patch-source
+
+      - name: Checkout exact upstream base
+        uses: actions/checkout@v4
+        with:
+          repository: moryoav/home-assistant-codex
+          ref: ce05342ec6e9b8b18df8c7884f5cad4eb72f60a3
+          path: src
+
+      - name: Verify base, patch, apply, and verify patched sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_commit="ce05342ec6e9b8b18df8c7884f5cad4eb72f60a3"
+          actual_commit="$(git -C src rev-parse HEAD)"
+          test "$actual_commit" = "$expected_commit"
+
+          test -f src/codex-cli-worker/Dockerfile
+          test -f src/codex-cli-worker/server.py
+          test -f src/codex-cli-worker/ha_data_mcp.py
+          test -f src/codex-cli-worker/ha_data.py
+          test -f src/codex-cli-worker/verification_mcp.py
+
+          patch_file="patch-source/patches/inventory-tools-fork-v0.1.82-v2.patch"
+          test -f "$patch_file"
+          echo "441e61bc15242ff8964d05e43bfa6c87119427f25e8fb50a11571c0ba1f8285c  $patch_file" | sha256sum --check -
+
+          verify_before="$(git -C src show "$expected_commit:codex-cli-worker/verification_mcp.py" | sha256sum | awk '{print $1}')"
+
+          git -C src/codex-cli-worker apply --check --whitespace=error -p1 "../../$patch_file"
+          git -C src/codex-cli-worker apply --whitespace=error -p1 "../../$patch_file"
+
+          echo "8e56ab14a517ce2b9b3c11feffab86537d334b3e55b1b80861f94f7a05550482  src/codex-cli-worker/server.py" | sha256sum --check -
+          echo "9ac850b4485fd0a1980fcde65037616c2a25d7e04507f7d6480c8e98a074282c  src/codex-cli-worker/ha_data_mcp.py" | sha256sum --check -
+          echo "da1bd0b863ead4781713c686124f6c0cb1d014230f858c05d1d5f8a11fa23162  src/codex-cli-worker/ha_data.py" | sha256sum --check -
+
+          expected_changed="$(printf '%s\n' \
+            'codex-cli-worker/ha_data.py' \
+            'codex-cli-worker/ha_data_mcp.py' \
+            'codex-cli-worker/server.py')"
+          actual_changed="$(git -C src diff --name-only | sort)"
+          diff -u <(printf '%s\n' "$expected_changed") <(printf '%s\n' "$actual_changed")
+
+          verify_after="$(sha256sum src/codex-cli-worker/verification_mcp.py | awk '{print $1}')"
+          test "$verify_before" = "$verify_after"
+          printf 'verification_mcp.py unchanged: %s\n' "$verify_after" | tee verification-server-hash.txt
+
+          for tool in history statistics ha_entity_inventory ha_device_inventory ha_entity_registry ha_integration_inventory ha_health_summary; do
+            grep -Fq "\"tools.$tool.approval_mode\":" src/codex-cli-worker/server.py
+          done
+          grep -Fq 'HA_DATA_SOCKET' src/codex-cli-worker/ha_data_mcp.py
+          grep -Fq '/data/ha-data.sock' src/codex-cli-worker/ha_data_mcp.py
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build local image (no registry push)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./src/codex-cli-worker
+          file: ./src/codex-cli-worker/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: codex-cli-worker:0.1.82-inventory-v2
+
+      - name: Validate image imports and both MCP servers offline
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm -i --entrypoint python3 codex-cli-worker:0.1.82-inventory-v2 - <<'PY'
+          import importlib.util
+          import json
+          import os
+          import subprocess
+          import sys
+
+          ROOT = "/"
+          sys.path.insert(0, ROOT)
+          for filename in ("server.py", "ha_data.py", "ha_data_mcp.py", "verification_mcp.py"):
+              path = os.path.join(ROOT, filename)
+              if not os.path.isfile(path):
+                  raise SystemExit(f"Missing expected module: {filename}")
+              spec = importlib.util.spec_from_file_location(f"ci_{filename[:-3]}", path)
+              module = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(module)
+              import py_compile
+              py_compile.compile(path, doraise=True)
+              print(f"IMPORT_OK {filename}")
+
+          inventory_names = {
+              "ha_entity_inventory",
+              "ha_device_inventory",
+              "ha_entity_registry",
+              "ha_integration_inventory",
+              "ha_health_summary",
+          }
+          legacy_names = {"history", "statistics"}
+
+          def check_mcp_server(script, required_names=None, require_any=False):
+              requests = [
+                  {
+                      "jsonrpc": "2.0",
+                      "id": 1,
+                      "method": "initialize",
+                      "params": {
+                          "protocolVersion": "2024-11-05",
+                          "capabilities": {},
+                          "clientInfo": {"name": "inventory-v2-ci", "version": "1"},
+                      },
+                  },
+                  {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+              ]
+              payload = "".join(json.dumps(item) + "\n" for item in requests)
+              completed = subprocess.run(
+                  [sys.executable, os.path.join(ROOT, script)],
+                  input=payload,
+                  text=True,
+                  capture_output=True,
+                  timeout=15,
+                  check=False,
+              )
+              if completed.returncode != 0:
+                  raise SystemExit(f"{script} exited {completed.returncode}: {completed.stderr[-2000:]}")
+              responses = []
+              for line in completed.stdout.splitlines():
+                  if line.strip():
+                      try:
+                          responses.append(json.loads(line))
+                      except json.JSONDecodeError as exc:
+                          raise SystemExit(f"{script} emitted non-JSON stdout: {line[:200]!r}") from exc
+              by_id = {item.get("id"): item for item in responses if isinstance(item, dict)}
+              init = by_id.get(1, {})
+              listing = by_id.get(2, {})
+              if "result" not in init or "error" in init:
+                  raise SystemExit(f"{script} MCP initialize failed: {init}")
+              if "result" not in listing or "error" in listing:
+                  raise SystemExit(f"{script} tools/list failed: {listing}")
+              tools = listing["result"].get("tools")
+              if not isinstance(tools, list):
+                  raise SystemExit(f"{script} tools/list did not return a tools array")
+              names = {tool.get("name") for tool in tools if isinstance(tool, dict)}
+              if required_names and not required_names.issubset(names):
+                  raise SystemExit(f"{script} missing required tools: {sorted(required_names - names)}")
+              if require_any and not names:
+                  raise SystemExit(f"{script} returned no tools")
+              for tool in tools:
+                  if not isinstance(tool, dict) or not isinstance(tool.get("name"), str):
+                      raise SystemExit(f"{script} returned malformed tool metadata")
+              print(f"MCP_OK {script}: {len(names)} tools; names={','.join(sorted(names))}")
+              return tools
+
+          inventory_tools = check_mcp_server(
+              "ha_data_mcp.py",
+              required_names=inventory_names | legacy_names,
+          )
+          by_name = {tool["name"]: tool for tool in inventory_tools}
+          for name in inventory_names | legacy_names:
+              tool = by_name[name]
+              schema = tool.get("inputSchema")
+              annotations = tool.get("annotations", {})
+              if not isinstance(schema, dict) or schema.get("type") != "object":
+                  raise SystemExit(f"{name} has no object inputSchema")
+              if annotations.get("readOnlyHint") is not True:
+                  raise SystemExit(f"{name} is not annotated read-only")
+              if annotations.get("destructiveHint") is not False:
+                  raise SystemExit(f"{name} destructiveHint is not false")
+          print("SCHEMA_OK inventory + history + statistics; all marked read-only")
+
+          check_mcp_server("verification_mcp.py", require_any=True)
+          print("OFFLINE_MCP_VALIDATION_PASSED")
+          PY
+
+      - name: Verify image platform and absence of embedded credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker image inspect codex-cli-worker:0.1.82-inventory-v2 \
+            --format '{{.Id}} {{.Os}}/{{.Architecture}}' | tee image-inspect.txt
+          docker image inspect codex-cli-worker:0.1.82-inventory-v2 \
+            --format '{{json .Config.Env}}' > image-env.json
+          python3 - <<'PY'
+          import json
+          import re
+          with open("image-env.json", encoding="utf-8") as handle:
+              env = json.load(handle) or []
+          secret_names = []
+          for item in env:
+              key, _, value = item.partition("=")
+              if re.search(r"(TOKEN|SECRET|PASSWORD|API_KEY|CREDENTIAL)", key, re.I) and value.strip():
+                  secret_names.append(key)
+          if secret_names:
+              raise SystemExit("Image contains non-empty credential-like ENV entries: " + ", ".join(secret_names))
+          print("IMAGE_ENV_OK: no non-empty credential-like environment values")
+          PY
+          grep -q 'linux/amd64' image-inspect.txt
+
+      - name: Save image and build manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          docker save codex-cli-worker:0.1.82-inventory-v2 -o output/codex-cli-worker-0.1.82-inventory-v2-amd64.tar
+          cp image-inspect.txt output/
+          cp verification-server-hash.txt output/
+          cat > output/build-manifest.txt <<'EOF'
+          Upstream repository: https://github.com/moryoav/home-assistant-codex
+          Upstream commit: ce05342ec6e9b8b18df8c7884f5cad4eb72f60a3
+          Patch: inventory-tools-fork-v0.1.82-v2.patch
+          Patch SHA256: 441e61bc15242ff8964d05e43bfa6c87119427f25e8fb50a11571c0ba1f8285c
+          Image: codex-cli-worker:0.1.82-inventory-v2
+          Platform: linux/amd64
+          Registry push: NOT PERFORMED
+          Installed Worker: NOT MODIFIED
+          Home Assistant: NOT MODIFIED
+          Services restarted: NONE
+          Validation: imports, MCP initialize/tools/list, tool names and read-only schemas
+          Home Assistant live calls: NOT PERFORMED
+          EOF
+          cat image-inspect.txt >> output/build-manifest.txt
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-cli-worker-0.1.82-inventory-v2-amd64
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
