@@ -80,7 +80,7 @@ jobs:
           platforms: linux/amd64
           load: true
           push: false
-          tags: ghcr.io/dudu-videovox/codex-cli-worker:0.1.83
+          tags: codex-cli-worker:0.1.82-inventory-v2
 
       - name: Validate image imports and both MCP servers offline
         shell: bash
