@@ -1,9 +1,9 @@
 name: Codex CLI Worker
 description: Run Codex CLI tasks against the Home Assistant config folder.
-version: "0.1.82"
+version: "0.1.83"
 slug: codex_cli_worker
 url: https://github.com/moryoav/home-assistant-codex
-image: ghcr.io/moryoav/codex-cli-worker
+image: ghcr.io/dudu-videovox/codex-cli-worker
 init: false
 startup: services
 boot: manual
